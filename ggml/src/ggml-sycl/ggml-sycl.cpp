@@ -5084,13 +5084,28 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
+// the XMX kernel takes this weight type and batch on this device, once the weight is in the reorder layout
+static bool xmx_batch_ok(int device, const ggml_tensor * src0, const ggml_tensor * src1) {
+#ifdef GGML_SYCL_MMVQ_HAS_XMX
+    return ggml_sycl_xmx_enabled(device) && ggml_sycl_xmx_supports_type(src0->type) &&
+           src1->ne[1] <= g_ggml_sycl_xmx_max_cols && src1->ne[2] == 1 && src1->ne[3] == 1;
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    return false;
+#endif // GGML_SYCL_MMVQ_HAS_XMX
+}
+
 static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
     return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
            // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
-           // all reorderable types have a _switch_ncols kernel.
-           dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+           // all reorderable types have a _switch_ncols kernel. A wider batch the XMX kernel takes
+           // bootstraps it too, so that batch does not wait for a decode step to reach the kernel.
+           (dst->src[1]->ne[1] <= 8 || xmx_batch_ok(ctx.device, dst->src[0], dst->src[1])) &&
+           dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
@@ -5162,17 +5177,8 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 
 // reordered weights of the types in ggml_sycl_xmx_supports_type() take the XMX kernel for wider batches
 static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_tensor * src1) {
-#ifdef GGML_SYCL_MMVQ_HAS_XMX
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    return ggml_sycl_xmx_enabled(device) && ggml_sycl_xmx_supports_type(src0->type) && extra &&
-           extra->optimized_feature.reorder && src1->ne[1] <= g_ggml_sycl_xmx_max_cols && src1->ne[2] == 1 &&
-           src1->ne[3] == 1;
-#else
-    GGML_UNUSED(device);
-    GGML_UNUSED(src0);
-    GGML_UNUSED(src1);
-    return false;
-#endif // GGML_SYCL_MMVQ_HAS_XMX
+    return extra && extra->optimized_feature.reorder && xmx_batch_ok(device, src0, src1);
 }
 
 static bool can_use_mul_mat_vec_q(int device, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5240,6 +5246,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 #endif
 
     bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(ctx.device, src0, src1, dst);
+    // a batch only the XMX kernel takes installs the reorder layout that kernel reads, then asks again
+    if (!use_mul_mat_vec_q && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        xmx_batch_ok(ctx.device, src0, src1)) {
+        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+        use_mul_mat_vec_q = can_use_mul_mat_vec_q(ctx.device, src0, src1, dst);
+    }
 
     bool use_mul_mat_q = can_use_mul_mat_q(src0, src1, dst);
 
