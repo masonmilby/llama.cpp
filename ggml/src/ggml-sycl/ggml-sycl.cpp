@@ -8026,6 +8026,46 @@ static void ggml_sycl_comm_exchange(ggml_backend_sycl_comm_context * comm, queue
     q1->memcpy(dst1, comm->host_in[1], nbytes);
 }
 
+// dst0 <- src1 and dst1 <- src0 by peer-to-peer copies, with no host wait: each queue copies the
+// other device's data once that device's queued work is done, and neither queue runs on until the
+// other's copy out of its memory is done.
+static void ggml_sycl_comm_exchange_p2p(ggml_backend_sycl_comm_context * comm, queue_ptr q0, queue_ptr q1,
+                                        void * dst0, const void * src1, void * dst1, const void * src0,
+                                        size_t nbytes) {
+    GGML_UNUSED(comm);
+    sycl::event e_ready_0 = q0->ext_oneapi_submit_barrier();
+    sycl::event e_ready_1 = q1->ext_oneapi_submit_barrier();
+
+    sycl::event e_cpy_0 = q0->submit([&](sycl::handler & h) {
+        h.depends_on(e_ready_1);
+        h.memcpy(dst0, src1, nbytes);
+    });
+    sycl::event e_cpy_1 = q1->submit([&](sycl::handler & h) {
+        h.depends_on(e_ready_0);
+        h.memcpy(dst1, src0, nbytes);
+    });
+
+    q0->ext_oneapi_submit_barrier({e_cpy_1});
+    q1->ext_oneapi_submit_barrier({e_cpy_0});
+}
+
+// Peer copies between USM allocations need one shared context and peer access both ways.
+static bool ggml_sycl_comm_enable_peer_access(queue_ptr q0, queue_ptr q1) {
+    using sycl::ext::oneapi::peer_access;
+    if (q0->get_context() != q1->get_context()) {
+        return false;
+    }
+    const sycl::device dev0 = q0->get_device();
+    const sycl::device dev1 = q1->get_device();
+    if (!dev0.ext_oneapi_can_access_peer(dev1, peer_access::access_supported) ||
+        !dev1.ext_oneapi_can_access_peer(dev0, peer_access::access_supported)) {
+        return false;
+    }
+    dev0.ext_oneapi_enable_peer_access(dev1);
+    dev1.ext_oneapi_enable_peer_access(dev0);
+    return true;
+}
+
 void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {
     for (size_t i = 0; i < n_backends; ++i) {
         if (!ggml_backend_is_sycl(backends[i])) {
@@ -8049,10 +8089,14 @@ void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends)
 #if defined(_WIN32) || defined(_WIN64) // Not supported on Windows
     ctx->comm_exchange = ggml_sycl_comm_exchange;
 #else
-    // SYCL_ENABLE_DEFAULT_CONTEXTS=1 sets comm_exchange_fast on Linux - PR #30956
-    ctx->comm_exchange = (sctx0->stream()->get_context() == sctx1->stream()->get_context())
-                       ? ggml_sycl_comm_exchange_fast
-                       : ggml_sycl_comm_exchange;
+    if (ggml_sycl_comm_enable_peer_access(sctx0->stream(), sctx1->stream())) {
+        ctx->comm_exchange = ggml_sycl_comm_exchange_p2p;
+    } else {
+        // SYCL_ENABLE_DEFAULT_CONTEXTS=1 sets comm_exchange_fast on Linux - PR #30956
+        ctx->comm_exchange = (sctx0->stream()->get_context() == sctx1->stream()->get_context())
+                           ? ggml_sycl_comm_exchange_fast
+                           : ggml_sycl_comm_exchange;
+    }
 #endif
     return ctx;
 }
@@ -8129,8 +8173,8 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
     uint8_t * buf1 = comm_ctx->buf1->get();
 
     // F16 native path: direct 2-byte cross-device copy + add, skipping the
-    // F32 round-trip the meta-backend fallback would force. The devices are in separate SYCL
-    // contexts (a raw peer-USM q->memcpy would be a silent no-op), so copies go through host memory.
+    // F32 round-trip the meta-backend fallback would force. comm_exchange copies peer-to-peer
+    // when comm_init enabled peer access, and through host memory otherwise.
     if (tensors[0]->type == GGML_TYPE_F16) {
         sycl::half * f16_out0 = (sycl::half *) tensors[0]->data;
         sycl::half * f16_out1 = (sycl::half *) tensors[1]->data;
@@ -8166,7 +8210,6 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
         float * tmp0 = (float *) buf0;
         float * tmp1 = (float *) buf1;
 
-        // separate SYCL contexts: a raw peer-USM q->memcpy is a silent no-op, so stage through host memory
         comm_ctx->comm_exchange(comm_ctx, q0, q1, tmp0, tensors[1]->data, tmp1, tensors[0]->data, nbytes);
 
         q0->submit([&](sycl::handler & h) {
