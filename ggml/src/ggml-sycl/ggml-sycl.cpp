@@ -8055,8 +8055,8 @@ static bool ggml_sycl_comm_enable_peer_access(queue_ptr q0, queue_ptr q1) {
     if (q0->get_context() != q1->get_context()) {
         return false;
     }
-    const sycl::device dev0 = q0->get_device();
-    const sycl::device dev1 = q1->get_device();
+    sycl::device dev0 = q0->get_device();
+    sycl::device dev1 = q1->get_device();
     if (!dev0.ext_oneapi_can_access_peer(dev1, peer_access::access_supported) ||
         !dev1.ext_oneapi_can_access_peer(dev0, peer_access::access_supported)) {
         return false;
