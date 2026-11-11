@@ -7944,6 +7944,10 @@ struct ggml_backend_sycl_comm_context {
     std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf1;
     int64_t buf_nelem = 0;
 
+    // the peer-copy exchange reads these buffers across devices, and its copy engines faulted
+    // while they came from the VMM pool, so it takes them from plain device allocations instead
+    uint8_t * peer_buf[2] = { nullptr, nullptr };
+
     // pinned host staging per device context, reused across calls (queues are in-order)
     uint8_t * host_out[2] = { nullptr, nullptr };
     uint8_t * host_in[2]  = { nullptr, nullptr };  // only used by the 4-buffer path (separate SYCL contexts)
@@ -7962,6 +7966,15 @@ struct ggml_backend_sycl_comm_context {
             if (host_in[i])  { sycl::free(host_in[i],  sctx); host_in[i]  = nullptr; }
         }
         host_bytes = 0;
+    }
+
+    void free_peer() {
+        for (int i = 0; i < 2; ++i) {
+            if (peer_buf[i]) {
+                ggml_sycl_free_device(peer_buf[i], *((ggml_backend_sycl_context *) backends[i]->context)->stream());
+                peer_buf[i] = nullptr;
+            }
+        }
     }
 };
 
@@ -8118,6 +8131,7 @@ void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
             sctx0->stream()->wait();
             sctx1->stream()->wait();
             comm_ctx->free_host();
+            comm_ctx->free_peer();
         } catch (...) { /* best effort during shutdown */ }
     }
 
@@ -8165,12 +8179,22 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 
     // Grow per-device byte buffers if needed (4 * nelem bytes each).
     if (comm_ctx->buf_nelem < nelem) {
-        comm_ctx->buf0->realloc(nelem * 4);
-        comm_ctx->buf1->realloc(nelem * 4);
+        if (comm_ctx->comm_exchange == ggml_sycl_comm_exchange_p2p) {
+            // no host wait follows a peer-copy exchange, so earlier copies may still read the old buffers
+            q0->wait();
+            q1->wait();
+            comm_ctx->free_peer();
+            comm_ctx->peer_buf[0] = (uint8_t *) ggml_sycl_malloc_device(nelem * 4, *q0);
+            comm_ctx->peer_buf[1] = (uint8_t *) ggml_sycl_malloc_device(nelem * 4, *q1);
+            GGML_ASSERT(comm_ctx->peer_buf[0] && comm_ctx->peer_buf[1]);
+        } else {
+            comm_ctx->buf0->realloc(nelem * 4);
+            comm_ctx->buf1->realloc(nelem * 4);
+        }
         comm_ctx->buf_nelem = nelem;
     }
-    uint8_t * buf0 = comm_ctx->buf0->get();
-    uint8_t * buf1 = comm_ctx->buf1->get();
+    uint8_t * buf0 = comm_ctx->peer_buf[0] ? comm_ctx->peer_buf[0] : comm_ctx->buf0->get();
+    uint8_t * buf1 = comm_ctx->peer_buf[1] ? comm_ctx->peer_buf[1] : comm_ctx->buf1->get();
 
     // F16 native path: direct 2-byte cross-device copy + add, skipping the
     // F32 round-trip the meta-backend fallback would force. comm_exchange copies peer-to-peer
